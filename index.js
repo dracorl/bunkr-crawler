@@ -11,7 +11,6 @@ const DOMAINS = [
   "bunkr.cr",
   "bunkr.fi",
   "bunkr.pk",
-  "bunkr.ps",
   "bunkr.si",
   "bunkr.sk",
   "bunkr.ws",
@@ -343,7 +342,7 @@ class AlbumFileScraper {
 
   // Ana işleme fonksiyonu
   async processAlbums() {
-    const CONCURRENT_ALBUMS = 2;
+    const CONCURRENT_ALBUMS = 10;
     let hasMoreAlbums = true;
     let batchCount = 0;
 
