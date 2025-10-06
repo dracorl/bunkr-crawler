@@ -21,6 +21,7 @@ const albumSchema = new mongoose.Schema({
   state: {
     type: Boolean,
     default: false,
+    required: false,
   },
 });
 

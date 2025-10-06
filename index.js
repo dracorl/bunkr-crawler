@@ -32,6 +32,7 @@ class AlbumFileScraper {
     this.failedAlbums = 0;
     this.domainRotationCount = 0;
     this.isShuttingDown = false;
+    this.domainRotationLock = null;
   }
 
   async connectDB() {
@@ -44,24 +45,36 @@ class AlbumFileScraper {
     }
   }
 
-  // Domain rotasyonu
-  getNextDomain() {
+  // ✅ EN İYİ ÇÖZÜM: Lock mekanizması ile senkronizasyon
+  async getNextDomain() {
     if (this.isShuttingDown) return null;
+
+    // Eğer domain rotasyon bekliyorsa, önce onu bekle
+    if (this.domainRotationLock) {
+      await this.domainRotationLock;
+    }
 
     const domain = DOMAINS[this.currentDomainIndex];
     this.currentDomainIndex = (this.currentDomainIndex + 1) % DOMAINS.length;
 
+    // Domain rotasyonu başlat
     if (this.currentDomainIndex === 0) {
       this.domainRotationCount++;
       console.log(
         `🔄 Domain listesi başa döndü (${this.domainRotationCount}. tur), 2 saniye bekleniyor...`
       );
-      return new Promise((resolve) => {
-        setTimeout(() => resolve(domain), 2000);
+
+      // Yeni lock oluştur - tüm sonraki çağrılar bunu bekleyecek
+      this.domainRotationLock = new Promise((resolve) => {
+        setTimeout(() => {
+          console.log(`✅ Domain rotasyon beklemesi tamamlandı`);
+          this.domainRotationLock = null;
+          resolve();
+        }, 2000);
       });
     }
 
-    return Promise.resolve(domain);
+    return domain;
   }
 
   // Tüm domain'leri deneyerek sayfa çek
@@ -340,70 +353,66 @@ class AlbumFileScraper {
     return await Album.find({ state: false }).limit(limit);
   }
 
-  // Ana işleme fonksiyonu
-  async processAlbums() {
-    const CONCURRENT_ALBUMS = 10;
-    let hasMoreAlbums = true;
-    let batchCount = 0;
+  // ✅ EN İYİ ÇÖZÜM: Sürekli akış
+  async processAlbumsContinuous() {
+    const CONCURRENT_ALBUMS = 100;
+    let activeAlbums = new Set();
 
-    console.log("🚀 Albüm işleme başlatılıyor...");
-    console.log(`🎯 Aynı anda ${CONCURRENT_ALBUMS} albüm işlenecek`);
+    console.log("🚀 Sürekli albüm işleme başlatılıyor...");
 
-    while (hasMoreAlbums && !this.isShuttingDown) {
-      batchCount++;
-      console.log(`\n📦 Batch ${batchCount} işleniyor...`);
-
+    while (!this.isShuttingDown) {
       try {
-        const albums = await this.getAlbumsBatch(CONCURRENT_ALBUMS);
+        // Aktif albüm sayısını kontrol et
+        if (activeAlbums.size < CONCURRENT_ALBUMS) {
+          const needed = CONCURRENT_ALBUMS - activeAlbums.size;
+          const newAlbums = await this.getAlbumsBatch(needed);
 
-        if (albums.length === 0) {
-          console.log("✅ Tüm albümler işlendi!");
-          hasMoreAlbums = false;
-          break;
+          if (newAlbums.length === 0 && activeAlbums.size === 0) {
+            console.log("✅ Tüm albümler işlendi!");
+            break;
+          }
+
+          // Yeni albümleri başlat
+          newAlbums.forEach((album) => {
+            const albumPromise = this.processAllAlbumPages(album.link)
+              .then((fileCount) => {
+                this.updateAlbumState(album, true);
+                console.log(`✅ ${album.name}: ${fileCount} dosya işlendi`);
+                activeAlbums.delete(albumPromise);
+              })
+              .catch((error) => {
+                if (!this.isShuttingDown) {
+                  console.error(`❌ ${album.name}: ${error.message}`);
+                  this.updateAlbumState(album, false);
+                  this.failedAlbums++;
+                }
+                activeAlbums.delete(albumPromise);
+              });
+
+            activeAlbums.add(albumPromise);
+            console.log(
+              `🎵 Albüm başlatıldı: ${album.name} (Aktif: ${activeAlbums.size})`
+            );
+          });
         }
 
-        console.log(`📁 ${albums.length} albüm işlenecek`);
-
-        const albumPromises = albums.map((album) =>
-          this.processAllAlbumPages(album.link)
-            .then((fileCount) => {
-              this.updateAlbumState(album, true);
-              console.log(`✅ ${album.name}: ${fileCount} dosya işlendi`);
-              return fileCount;
-            })
-            .catch((error) => {
-              if (!this.isShuttingDown) {
-                console.error(`❌ ${album.name}: ${error.message}`);
-                this.updateAlbumState(album, false);
-                this.failedAlbums++;
-              }
-              return 0;
-            })
-        );
-
-        await Promise.all(albumPromises);
-
-        if (!this.isShuttingDown && hasMoreAlbums) {
-          console.log(
-            `⏳ Batch ${batchCount} tamamlandı, sonraki batch hazırlanıyor...`
-          );
-          await this.delay(1000);
-        }
+        // Kısa bekleme ve devam et
+        await this.delay(100);
       } catch (error) {
         if (!this.isShuttingDown) {
-          console.error("Batch işleme hatası:", error);
+          console.error("Albüm işleme hatası:", error);
         }
-        hasMoreAlbums = false;
       }
     }
 
-    if (!this.isShuttingDown) {
-      console.log("\n🎉 TÜM İŞLEMLER TAMAMLANDI!");
-      console.log(`✅ Başarılı albümler: ${this.processedAlbums}`);
-      console.log(`❌ Başarısız albümler: ${this.failedAlbums}`);
-      console.log(`📊 Toplam dosya: ${this.processedFiles}`);
-      console.log(`🔄 Toplam domain turu: ${this.domainRotationCount}`);
-    }
+    // Kalan işlemleri bekle
+    console.log("⏳ Kalan albüm işlemleri tamamlanıyor...");
+    await Promise.allSettled([...activeAlbums]);
+
+    console.log("\n🎉 TÜM İŞLEMLER TAMAMLANDI!");
+    console.log(`✅ Başarılı albümler: ${this.processedAlbums}`);
+    console.log(`❌ Başarısız albümler: ${this.failedAlbums}`);
+    console.log(`📊 Toplam dosya: ${this.processedFiles}`);
   }
 
   async delay(ms) {
@@ -430,7 +439,7 @@ class AlbumFileScraper {
       process.on("SIGINT", () => this.shutdown());
       process.on("SIGTERM", () => this.shutdown());
 
-      await this.processAlbums();
+      await this.processAlbumsContinuous();
     } catch (error) {
       console.error("Program başlatma hatası:", error);
     } finally {
